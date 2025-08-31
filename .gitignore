@@ -2,3 +2,7 @@
 __pycache__/
 .env
 logs/
+sandbox/
+!sandbox/.gitkeep
+logs/
+!logs/.gitkeep
