@@ -53,27 +53,45 @@ def all_compound_sequences(comps: List[str], k: int) -> List[List[str]]:
     rec([])
     return res
 
-def solve_strategy(race: Race, base_laptime_s: float, deg_profile: Dict[str, float],
-                   min_stint_laps: int, max_stint_laps: int, max_stops: int = 2) -> Dict:
+def solve_strategy(
+    race: Race,
+    base_laptime_s: float,
+    deg_profile: Dict[str, float],
+    min_stint_laps: int,
+    max_stint_laps: int,
+    max_stops: int = 2,
+    enforce_two_compounds: bool = True
+) -> Dict:
     best = None
     splits = enumerate_splits(race.laps, min_stint_laps, max_stint_laps, max_stops)
     cache: Dict[int, List[List[str]]] = {}
     for plan in splits:
         k = len(plan)
-        if k not in cache: cache[k] = all_compound_sequences(race.compounds, k)
+        if k not in cache:
+            cache[k] = all_compound_sequences(race.compounds, k)
         for seq in cache[k]:
-            total = 0.0; breakdown: List[float] = []
+            # Regla de la FIA: si hay ≥2 stints, deben usarse ≥2 compuestos distintos (carrera seca)
+            if enforce_two_compounds and k >= 2 and len(set(seq)) < 2:
+                continue
+
+            total = 0.0
+            breakdown: List[float] = []
             for laps, comp in zip(plan, seq):
                 stint = stint_time_s(base_laptime_s, deg_profile.get(comp, 0.0), laps)
-                breakdown.append(stint); total += stint
+                breakdown.append(stint)
+                total += stint
             total += (k - 1) * race.pit_loss_s
-            if best is None or total < best[0]:
+
+            if (best is None) or (total < best[0]):
                 stops, acc = [], 0
                 for i in range(k - 1):
-                    acc += plan[i]; stops.append(acc)
+                    acc += plan[i]
+                    stops.append(acc)
                 best = (total, plan, seq, stops, breakdown)
+
     if best is None:
         return {"ok": False, "error": "No feasible plan with given constraints."}
+
     total, plan, seq, stops, bd = best
     return {
         "ok": True,
@@ -84,6 +102,7 @@ def solve_strategy(race: Race, base_laptime_s: float, deg_profile: Dict[str, flo
         "stint_breakdown_s": [round(x, 3) for x in bd],
         "notes": f"{len(plan)-1} stop(s); pit_loss={race.pit_loss_s}s; base={base_laptime_s}s; deg={deg_profile}"
     }
+
 
 # --- Herramientas MCP -----
 @mcp.tool()
@@ -109,7 +128,7 @@ async def recommend_strategy(race_id: str, base_laptime_s: float,
     if not r:
         return json.dumps({"ok": False, "error": "race_id not found"}, ensure_ascii=False)
     deg = {"SOFT": deg_soft_s, "MEDIUM": deg_medium_s, "HARD": deg_hard_s}
-    res = solve_strategy(r, base_laptime_s, deg, min_stint_laps, max_stint_laps, max_stops)
+    res = solve_strategy(r, base_laptime_s, deg, min_stint_laps, max_stint_laps, max_stops, enforce_two_compounds=True)
     return json.dumps(res, ensure_ascii=False, indent=2)
 
 async def amain():
