@@ -1,0 +1,19 @@
+{
+  "f1_monica": {
+    "type": "stdio",
+    "cwd": "/home/tu_usuario/peers/monica_f1_repo",
+    "command": "python3",
+    "args": ["-m", "src.mcp_f1_server"]
+  },
+  "filesystem_official": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+  },
+  "pokemon_juan": {
+    "type": "stdio",
+    "cwd": "/home/tu_usuario/peers/pokemon_repo",
+    "command": "python3",
+    "args": ["-m", "server.mcp"] 
+  }
+}
