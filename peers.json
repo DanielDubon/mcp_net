@@ -15,5 +15,25 @@
     "cwd": "/home/tu_usuario/peers/pokemon_repo",
     "command": "python3",
     "args": ["-m", "server.mcp"] 
+  },
+  
+  "trivial_local": {
+    "type": "stdio",
+    "command": "python3",
+    "args": ["-m", "src.mcp_trivial_server"],
+    "cwd": null
+  },
+  
+ "trivial_cloud": {
+    "type": "sse",
+    "url": "https://thirty-shrimps-ring.loca.lt/sse"
+ },
+    "spotify": {
+    "type": "stdio",
+    "cwd": "/home/danidubon12/redes/spotify-mcp/src",
+    "command": "python3",
+    "args": ["-m", "spotify_mcp"]
   }
+
+
 }

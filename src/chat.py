@@ -5,11 +5,148 @@ from anthropic import Anthropic
 from .log import jdump
 
 import asyncio, json
+import sys
+import re
 from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
+
+LAST_RACE_ID = None              
+LAST_PLAN_ARGS = None
+
+RACE_ALIASES = {
+    "monza": "demo_monza_2024",
+    "italia": "demo_monza_2024",
+    "mexico": "demo_mexico_2024",
+    "ciudad de mexico": "demo_mexico_2024",
+    "cdmx": "demo_mexico_2024",
+}
+
+DEFAULT_PLAN = {
+    "base_laptime_s": 80.0,
+    "deg_soft_s": 0.12,
+    "deg_medium_s": 0.08,
+    "deg_hard_s": 0.05,
+    "min_stint_laps": 10,
+    "max_stint_laps": 30,
+    "max_stops": 2,
+}
+
+PRESETS = {
+    "demo_monza_2024": {
+        "base_laptime_s": 79.8,
+        "deg_soft_s": 0.13,
+        "deg_medium_s": 0.09,
+        "deg_hard_s": 0.06,
+        "min_stint_laps": 9,
+        "max_stint_laps": 28,
+        "max_stops": 2,
+    },
+    "demo_mexico_2024": {
+        "base_laptime_s": 80.0,
+        "deg_soft_s": 0.12,
+        "deg_medium_s": 0.08,
+        "deg_hard_s": 0.05,
+        "min_stint_laps": 10,
+        "max_stint_laps": 30,
+        "max_stops": 2,
+    },
+}
+
+def _merge_params(race_id: str, overrides: dict) -> dict:
+    # orden: default -> preset pista -> overrides del usuario
+    out = DEFAULT_PLAN.copy()
+    if race_id in PRESETS:
+        out.update(PRESETS[race_id])
+    for k, v in overrides.items():
+        if v is not None:
+            out[k] = v
+    return out
+
+def _to_float(s: str) -> float | None:
+    try:
+        return float(s.replace(",", "."))
+    except Exception:
+        return None
+
+def _find_number_after(t: str, kws: list[str]) -> float | None:
+    for kw in kws:
+        m = re.search(rf"{kw}\s*[=:]?\s*(-?\d+(?:[.,]\d+)?)", t)
+        if m: return _to_float(m.group(1))
+    return None
+
+def _find_int_after(t: str, kws: list[str]) -> int | None:
+    for kw in kws:
+        m = re.search(rf"{kw}\s*[=:]?\s*(\d+)", t)
+        if m:
+            try: return int(m.group(1))
+            except Exception: pass
+    return None
+
+def _find_int_before(t: str, kws_pattern: str) -> int | None:
+    # captura "3 paradas", "2 stops", etc.
+    m = re.search(rf"(\d+)\s+(?:{kws_pattern})\b", t)
+    if m:
+        try: return int(m.group(1))
+        except Exception: return None
+    return None
+
+_WORD2NUM = {"una":1, "uno":1, "dos":2, "tres":3, "cuatro":4}
+def _find_word_number_paradas(t: str) -> int | None:
+    m = re.search(r"\b(una|uno|dos|tres|cuatro)\s+paradas?\b", t)
+    if m: return _WORD2NUM.get(m.group(1))
+    return None
+
+def _format_strategy_txt(d: dict, used: dict) -> str:
+    
+    lines = []
+    rid = d.get("race_id", "?")
+    lines.append(f"Estrategia para {rid}:")
+    for stint in d.get("strategy", []):
+        lines.append(f"  • {stint}")
+    if d.get("stop_laps"):
+        laps = ", ".join(map(str, d["stop_laps"]))
+        lines.append(f"Paradas en vueltas: {laps}")
+    if "predicted_total_s" in d:
+        lines.append(f"Tiempo total estimado: {d['predicted_total_s']:.2f} s")
+    
+    lines.append("")
+    lines.append("Parametros usados (auto-relleno si no los diste):")
+    lines.append(f"  base_laptime_s: {used['base_laptime_s']}  (tiempo base por vuelta)")
+    lines.append(f"  deg_soft_s:     {used['deg_soft_s']}    (degradación s/vuelta)")
+    lines.append(f"  deg_medium_s:   {used['deg_medium_s']}")
+    lines.append(f"  deg_hard_s:     {used['deg_hard_s']}")
+    lines.append(f"  min_stint_laps: {used['min_stint_laps']}")
+    lines.append(f"  max_stint_laps: {used['max_stint_laps']}")
+    lines.append(f"  max_stops:      {used['max_stops']}")
+    return "\n".join(lines)
+
+def explain_last_plan() -> str:
+    if not LAST_RACE_ID or not LAST_PLAN_ARGS:
+        return "Aun no tengo una estrategia calculada. Pide una (por ejemplo: 'estrategia monza a dos paradas')."
+    txt = [
+        "Como interpreto los parametros:",
+        "• base_laptime_s: ritmo 'limpio' sin desgaste ni tráfico.",
+        "• deg_*_s: cuanto se hace más lenta cada vuelta por desgaste (s/vuelta).",
+        "• min/max_stint_laps: limites de vueltas por stint.",
+        "• max_stops: tope de paradas a optimizar.",
+        "",
+        "De donde salen:",
+        "• Si no escribes numeros, uso presets por circuito (o defaults genericos).",
+        "• Si das numeros, tus valores pisan los presets.",
+        "",
+        "Ultimos usados:"
+    ]
+    for k, v in LAST_PLAN_ARGS.items():
+        txt.append(f"  - {k}: {v}")
+    return "\n".join(txt)
+
+
 
 load_dotenv()
+
+server = StdioServerParameters(command=sys.executable, args=["-m", "src.mcp_f1_server"])
 
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not API_KEY:
@@ -34,31 +171,48 @@ def _load_peers():
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
     
-def _build_server_params(cfg: dict) -> StdioServerParameters:
-    t = cfg.get("type", "stdio")
-    if t != "stdio":
-        raise ValueError("Only 'stdio' peers supported in this snippet")  # simple
-    command = cfg["command"]
-    args = cfg.get("args", [])
-    cwd = cfg.get("cwd")
-    return StdioServerParameters(command=command, args=args, cwd=cwd)
+def _build_transport(cfg: dict):
+    
+    t = (cfg.get("type") or "stdio").lower()
+    if t == "stdio":
+        command = cfg["command"]
+        args = cfg.get("args", [])
+        cwd = cfg.get("cwd")
+        return ("stdio", StdioServerParameters(command=command, args=args, cwd=cwd))
+    if t == "sse":
+        url = cfg.get("url")
+        if not url:
+            raise ValueError("Peer 'sse' requiere 'url'")
+        return ("sse", url)
+    raise ValueError(f"Tipo de peer no soportado: {t}")
+
 
 def peer_call(alias: str, tool: str | None, args: dict | None) -> str:
     peers = _load_peers()
     if alias not in peers:
         return f"[peer:{alias}] not found in peers.json"
-    server_params = _build_server_params(peers[alias])
+
+    kind, param = _build_transport(peers[alias])
 
     async def _run():
         async with AsyncExitStack() as stack:
-            read, write = await stack.enter_async_context(stdio_client(server_params))
+            if kind == "stdio":
+                read, write = await stack.enter_async_context(stdio_client(param))
+            else:  # kind == "sse"
+                read, write = await stack.enter_async_context(sse_client(url=param))
+
             session = await stack.enter_async_context(ClientSession(read, write))
             await session.initialize()
+
             if not tool:
                 tools = await session.list_tools()
                 return "[TOOLS] " + ", ".join(t.name for t in tools.tools)
+
             resp = await session.call_tool(tool, args or {})
             return _mcp_text(resp)
+
+    return asyncio.run(_run())
+
 
     return asyncio.run(_run())
 
@@ -76,6 +230,116 @@ def push(hist: List[Dict[str, str]], role: str, content: str):
     if len(hist) > 8:
         del hist[:-8]
 
+def _norm(txt: str) -> str:
+    
+    t = txt.lower()
+    t = ud.normalize("NFD", t)
+    t = "".join(c for c in t if ud.category(c) != "Mn")
+    return t.strip()
+
+def try_nl_command(user_text: str) -> str | None:
+    t = _norm(user_text)
+
+    
+    talks_music = (
+        "spotify" in t or
+        re.search(r"\b(cancion|musica|tema|track|song|rol(a)?)\b", t) is not None
+    )
+
+    if talks_music:
+       
+        if re.search(r"\b((cambia(r)?)\s*(de|la)?\s*(cancion|tema|rola)|pasa(r)?\s*(la)?\s*(cancion|tema|rola)|avanza(r)?\s*(la)?\s*(cancion|tema|rola)|salta(r)?\s*(la)?\s*(cancion|tema|rola)|siguiente|next|skip)\b", t):
+            return peer_call("spotify", "next_track", {})
+
+        # anterior
+        if re.search(r"\b(anterior|prev(ious)?|regresa(r)?)\b", t):
+            return peer_call("spotify", "previous_track", {})
+
+        # pausar / continuar
+        if re.search(r"\b(pausa(r)?|pause|deten(er)?)\b", t):
+            return peer_call("spotify", "pause_track", {})
+        if re.search(r"\b(reanuda(r)?|resume|continua(r)?|play)\b", t):
+            return peer_call("spotify", "resume_track", {})
+
+        # que suena / cancion actual
+        if re.search(r"(que suena|cancion actual|que estoy escuchando|currently playing)", t):
+            return peer_call("spotify", "current_track", {})
+
+        # reproducir algo específico: "pon X", "reproduce X", "play X"
+        m = re.search(r"\b(pon|reproduce|play)\s+(.+)", t)
+        if m:
+            query = m.group(2).strip().strip(".!?")
+            if query:
+                return peer_call("spotify", "search_and_play", {"query": query})
+
+    # ---------- F1 ----------
+    if re.search(r"\b(estrategia|plan|stint(s)?|paradas|pit\s*stops?)\b", t):
+        
+        race_id = None
+        m = re.search(r"(demo_[a-z0-9_\-]+_2024)", t)
+        if m:
+            race_id = m.group(1)
+        else:
+            for alias, rid in RACE_ALIASES.items():
+                if alias in t:
+                    race_id = rid
+                    break
+        global LAST_RACE_ID
+        if not race_id and LAST_RACE_ID:
+            race_id = LAST_RACE_ID
+        if not race_id:
+            
+            return f1_call("get_calendar", {"season": 2024})
+
+       
+        base = _find_number_after(t, ["vuelta base", "tiempo base", "base", "base time", "base lap"])
+        dS   = _find_number_after(t, ["soft", "suave", "blanda", "degradacion soft", "deg soft"])
+        dM   = _find_number_after(t, ["medium", "media", "degradacion medium", "deg medium"])
+        dH   = _find_number_after(t, ["hard", "dura", "degradacion hard", "deg hard"])
+        minL = _find_int_after(t, ["min stint", "stint minimo", "minimo", "min"])
+        maxL = _find_int_after(t, ["max stint", "stint maximo", "maximo", "max"])
+
+        # stops: acepta "paradas 3", "3 paradas", "dos paradas", etc.
+        stops = _find_int_after(t, ["paradas", "stops", "pit stops"])
+        if stops is None:
+            stops = _find_int_before(t, r"paradas?|stops?")
+        if stops is None:
+            stops = _find_word_number_paradas(t)
+
+        overrides = {
+            "base_laptime_s": base,
+            "deg_soft_s": dS,
+            "deg_medium_s": dM,
+            "deg_hard_s": dH,
+            "min_stint_laps": minL,
+            "max_stint_laps": maxL,
+            "max_stops": stops,
+        }
+        used = _merge_params(race_id, overrides)
+
+        
+        out = f1_call("recommend_strategy", {"race_id": race_id, **used})
+        
+        global LAST_PLAN_ARGS
+        LAST_RACE_ID = race_id
+        LAST_PLAN_ARGS = {"race_id": race_id, **used}
+
+        
+        try:
+            d = json.loads(out)
+            if isinstance(d, dict) and d.get("ok"):
+                return _format_strategy_txt(d, used)
+        except Exception:
+            pass
+        return out
+      
+    if re.search(r"\b(explica|explicame|como calculaste|de donde salen|parametros)\b", t) and LAST_RACE_ID:
+        return explain_last_plan()
+
+    return None
+
+
+
 def run_chat():
     history: List[Dict[str, str]] = []
     print("Chat MCP-Proy1 (escribe 'exit' para salir)")
@@ -90,6 +354,11 @@ def run_chat():
                 out = handle_f1_command(user)
                 print(out)
                 continue
+            routed = try_nl_command(user)
+            if routed is not None:
+                print(routed)
+                jdump({"type": "nl_dispatch", "input": sanitize(user), "output": sanitize(routed)})
+                continue
         except EOFError:
             break
         if user is None:
@@ -100,18 +369,22 @@ def run_chat():
 
         push(history, "user", user)
 
-        msg = client.messages.create(
-            model=MODEL,
-            max_tokens=400,
-            messages=history
-        )
-        reply = msg.content[0].text if msg.content else ""
-        reply = sanitize(reply)
-        print(reply)
-
-        jdump({"type": "llm_exchange", "request": sanitize(user), "response": reply})
-        push(history, "assistant", reply)
-        
+        try:
+            msg = client.messages.create(
+                model=MODEL,
+                max_tokens=400,
+                messages=history
+            )
+            reply = msg.content[0].text if msg.content else ""
+            reply = sanitize(reply)
+            print(reply)
+            jdump({"type": "llm_exchange", "request": sanitize(user), "response": reply})
+            push(history, "assistant", reply)
+        except Exception as e:
+            print(f"[LLM no disponible] {e}")
+            jdump({"type": "llm_error", "request": sanitize(user), "error": str(e)})
+          
+            continue
 
 
 def f1_call(tool: str, args: dict) -> str:
@@ -124,9 +397,13 @@ def f1_call(tool: str, args: dict) -> str:
             if tool == "__list__":
                 tools = await session.list_tools()
                 return "TOOLS: " + ", ".join(t.name for t in tools.tools)
+            if tool in ("get_race", "recommend_strategy") and "race_id" in args:
+                global LAST_RACE_ID
+                LAST_RACE_ID = args["race_id"]
             resp = await session.call_tool(tool, args)
             return _mcp_text(resp)
     return asyncio.run(_run())
+
 
 def handle_peer_cmd(line: str) -> str:
     # Sintaxis:

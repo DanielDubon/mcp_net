@@ -1,8 +1,11 @@
 import asyncio, json
 from dataclasses import dataclass
 from typing import Dict, List, Literal
+from starlette.responses import PlainTextResponse
+from starlette.requests import Request
 
-from mcp.server.fastmcp import FastMCP
+
+from fastmcp import FastMCP
 
 
 mcp = FastMCP("f1-strategy-mcp")
@@ -131,9 +134,10 @@ async def recommend_strategy(race_id: str, base_laptime_s: float,
     res = solve_strategy(r, base_laptime_s, deg, min_stint_laps, max_stint_laps, max_stops, enforce_two_compounds=True)
     return json.dumps(res, ensure_ascii=False, indent=2)
 
-async def amain():
-    async with stdio_server() as (reader, writer):
-        await mcp.run("stdio", reader, writer) 
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_req: Request) -> PlainTextResponse:
+    return PlainTextResponse("OK")
 
 if __name__ == "__main__":
-    mcp.run("stdio")
+
+    mcp.run()
